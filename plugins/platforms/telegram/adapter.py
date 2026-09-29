@@ -3911,12 +3911,21 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False, metadata: Optional[Dict[str, Any]] = None,
+        parse_mode: Optional[str] = None,
    ) -> SendResult:
         """Edit a previously sent Telegram message.
 
         Telegram caps a message at 4096 UTF-16 codeunits. Streaming replies that outgrow it must NOT be truncated
         silently nor fail (the consumer would re-send a duplicate): edit with the first chunk, send the rest as
-        continuations, and return the final chunk's id as the next edit target."""
+        continuations, and return the final chunk's id as the next edit target.
+
+        ``parse_mode`` (``"HTML"``, ``"MarkdownV2"``, ...) marks ``content`` as already formatted by the caller
+        (a plugin drawing its own screen): it is sent verbatim with that parse mode on interim and final edits
+        alike — no MarkdownV2 conversion, no rich upgrade, no plain-text fallback (rejected markup comes back as
+        a failed SendResult so the caller degrades on its own terms) and no split or truncation on overflow
+        (markup does not count toward the cap, so the API's verdict is returned as is). Such an edit is a
+        deliberate message rather than a preview the next edit supersedes: a busy slot delays it like a send
+        instead of skipping it."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
         # Shared per-chat budget (#116312): an interim (preview) edit is SKIPPED when the slot is busy —
@@ -3926,8 +3935,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # below already throttles them to one real edit per ~4096-char growth. Consumed only when the
         # edit actually fires. The skip is flagged in raw_response so the stream consumer does not
         # record never-shown text as the visible prefix (a later flood fallback would then drop the
-        # tail the user never saw).
-        if (
+        # tail the user never saw). A caller-formatted edit (parse_mode set) is not a preview: nothing
+        # supersedes it, so like a send it waits for the slot instead of being skipped.
+        if parse_mode is not None:
+            slot_remaining = self._chat_outbound_slot_remaining(chat_id)
+            if slot_remaining > 0:
+                logger.debug(
+                    "[%s] pacing %s edit for chat %s (shared send+edit budget: slot in %.1fs)",
+                    self.name, parse_mode, chat_id, slot_remaining)
+                await asyncio.sleep(slot_remaining)
+        elif (
             not finalize
             and utf16_len(content) <= self.MAX_MESSAGE_LENGTH
             and self._chat_outbound_slot_remaining(chat_id) > 0
@@ -3946,7 +3963,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # 4,096 overflow pre-flight because the rich text cap is 32,768 — a rich table that exceeds the
         # MarkdownV2 limit must not be split into legacy chunks. Falls back to the legacy edit path
         # (overflow split included) on capability/permanent rejection.
-        if finalize and self._rich_eligible(content):
+        if finalize and parse_mode is None and self._rich_eligible(content):
             rich_result = await self._try_edit_rich(chat_id, message_id, content, metadata=metadata)
             if rich_result is not None:
                 return rich_result
@@ -3961,7 +3978,9 @@ class TelegramAdapter(BasePlatformAdapter):
         _saturated_preview = False
         if finalize:
             self._last_overflow_preview.pop(_preview_key, None)  # the final edit always delivers full content
-        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+        # Caller-formatted content skips the pre-flight: its markup does not count toward the cap, and
+        # splitting or truncating it would cut a tag in half — an overflow is reported from the API's verdict.
+        if parse_mode is None and utf16_len(content) > self.MAX_MESSAGE_LENGTH:
             if finalize:
                 return await self._edit_overflow_split(chat_id, message_id, content, finalize=finalize, metadata=metadata)
             content = self._truncate_stream_overflow_preview(content)
@@ -3974,6 +3993,9 @@ class TelegramAdapter(BasePlatformAdapter):
             # Content shrank back under the cap — clear stale saturation state so dedup can't mask an edit.
             self._last_overflow_preview.pop(_preview_key, None)
         try:
+            if parse_mode is not None:
+                await self._edit_text(chat_id, message_id, content, parse_mode)
+                return SendResult(success=True, message_id=message_id)
             if not finalize:
                 await self._edit_text(chat_id, message_id, content)
                 if _saturated_preview:
@@ -3989,6 +4011,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 return SendResult(success=True, message_id=message_id)
             # Reactive split: MarkdownV2 escapes can inflate the payload past the limit even when raw text fit.
             if "message_too_long" in err_str or "too long" in err_str:
+                if parse_mode is not None:
+                    safe_error = _redact_telegram_error_text(e)
+                    logger.warning(
+                        "[%s] %s edit of message %s too long, not split (caller-formatted): %s",
+                        self.name, parse_mode, message_id, safe_error)
+                    return SendResult(success=False, error=safe_error)
                 logger.debug(
                     "[%s] edit_message overflow (%d UTF-16 > %d), splitting", self.name, utf16_len(content), self.MAX_MESSAGE_LENGTH)
                 if finalize:
@@ -4015,7 +4043,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Telegram flood control, waiting %.1fs", self.name, wait)
                 await asyncio.sleep(wait)
                 try:
-                    await self._edit_text(chat_id, message_id, content)
+                    await self._edit_text(chat_id, message_id, content, parse_mode)
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)
