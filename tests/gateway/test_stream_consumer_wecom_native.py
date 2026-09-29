@@ -596,7 +596,11 @@ class TestClarifyEagerReseed:
 
         # User answered → request an eager re-seed.  NO on_delta yet.
         consumer.request_reopen_seed()
-        await self._drain(consumer, 0.05)  # let run() process _REOPEN_SEED
+        # Poll, not a fixed drain: the seed is emitted by run() when it gets its turn, which
+        # under CPU contention can be later than 50ms (the count below then sees no new frame).
+        await self._wait_until(lambda: len(
+            [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
+        ) > seeds_before)
 
         seeds_after = len(
             [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
@@ -1030,7 +1034,10 @@ class TestClarifyEagerReseed:
 
         # 第二轮 eager seed：即便标志有残留，仍能正确再次开流。
         consumer.request_reopen_seed()
-        await self._drain(consumer, 0.05)
+        # Poll, not a fixed drain: run() emits the seed on its own turn (flaked under contention).
+        await self._wait_until(lambda: len(
+            [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
+        ) > seeds_before_second_boundary)
 
         seeds_after = len(
             [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
