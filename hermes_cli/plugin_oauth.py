@@ -95,30 +95,44 @@ def _bundled_platform_env_names() -> frozenset[str]:
 
 @functools.lru_cache(maxsize=8)
 def _user_platform_manifests(stamp: tuple) -> tuple[tuple[dict, ...], bool]:
-    """The installed user platform manifests, and whether every one could be read. *stamp*
-    (``platform_manifest_stamp()``) keys the cache: an added, removed or edited manifest is read again."""
-    from hermes_cli.config import _platform_plugin_manifests
+    """The installed user platform manifests, and whether every one was read while *stamp*
+    (``platform_manifest_stamp()``) held. The stamp keys the cache, so an added, removed or edited manifest is read
+    again; a change during the read leaves this key incomplete for good."""
+    from hermes_cli.config import _platform_plugin_manifests, platform_manifest_stamp
 
     skipped: list = []
     manifests = tuple(manifest for _dir, manifest in _platform_plugin_manifests(source="user", skipped=skipped))
-    return manifests, not skipped
+    return manifests, not skipped and platform_manifest_stamp() == stamp
 
 
-def _endpoints(manifest: Mapping[str, Any], name: str) -> set[tuple[str, str]]:
-    """``(authorize_url, token_url)`` of each ``oauth:`` entry in *manifest* that sends variable *name*."""
-    return {(str(e.get("authorize_url")), str(e.get("token_url"))) for e in manifest.get("oauth") or []
-            if isinstance(e, dict) and name in (e.get("client_id_env"), e.get("client_secret_env"))}
+def _installed_platform_manifests() -> tuple[tuple[dict, ...], bool]:
+    from hermes_cli.config import platform_manifest_stamp
+
+    return _user_platform_manifests(platform_manifest_stamp())
 
 
-def _hermes_owned_env(name: str, manifest: Mapping[str, Any]) -> bool:
+def _channels(manifest: Mapping[str, Any], name: str) -> set[tuple[str, str]]:
+    """Where *manifest*'s ``oauth:`` entries send variable *name*, as ``(url, form field)``: a client id goes to the
+    authorize URL and the token URL, a client secret only to the token URL."""
+    channels: set[tuple[str, str]] = set()
+    for entry in manifest.get("oauth") or []:
+        if isinstance(entry, dict) and entry.get("client_id_env") == name:
+            channels |= {(str(entry.get("authorize_url")), "client_id"), (str(entry.get("token_url")), "client_id")}
+        if isinstance(entry, dict) and entry.get("client_secret_env") == name:
+            channels.add((str(entry.get("token_url")), "client_secret"))
+    return channels
+
+
+def _hermes_owned_env(name: str, manifest: Mapping[str, Any],
+                      installed: Callable[[], tuple[tuple[dict, ...], bool]]) -> bool:
     """A variable Hermes itself reads (a provider key, a platform secret): never a plugin's client variable,
     or a manifest could have Hermes POST that secret to the token URL it names. Platform manifests register
     their requires_env/optional_env too, for the config form. Such a name stays the plugin's own when its
-    manifest declares it and every installed platform manifest that declares it sends it to the same
-    endpoints (a second copy, the next version); a manifest that cannot be read counts as another owner."""
+    manifest declares it and every installed platform manifest that declares it already sends it through the
+    same channels (a second copy, the next version); a manifest that cannot be read counts as another owner.
+    *installed* gives the installed user platform manifests, once per parse."""
     from hermes_cli.auth import PROVIDER_REGISTRY
-    from hermes_cli.config import (
-        _EXTRA_ENV_KEYS, CORE_DECLARED_ENV_NAMES, _platform_manifest_env_entries, platform_manifest_stamp)
+    from hermes_cli.config import _EXTRA_ENV_KEYS, CORE_DECLARED_ENV_NAMES, _platform_manifest_env_entries
     from hermes_cli.config_env_routing import is_registered_env_name
     from hermes_cli.setup_hidden_env import is_setup_hidden_env
 
@@ -134,14 +148,15 @@ def _hermes_owned_env(name: str, manifest: Mapping[str, Any]) -> bool:
             return True
     except OSError:
         return True
-    installed, complete = _user_platform_manifests(platform_manifest_stamp())
-    ours = _endpoints(manifest, name)
+    manifests, complete = installed()
+    ours = _channels(manifest, name)
     return not complete or any(
-        not ours <= _endpoints(other, name) for other in installed
+        not ours <= _channels(other, name) for other in manifests
         if any(declared == name for declared, _secret, _meta in _platform_manifest_env_entries(other)))
 
 
-def _entry_problems(entry: dict, where: str, manifest: Mapping[str, Any]) -> list[str]:
+def _entry_problems(entry: dict, where: str, manifest: Mapping[str, Any],
+                    installed: Callable[[], tuple[tuple[dict, ...], bool]]) -> list[str]:
     oauth_id = entry.get("id")
     problems = [] if isinstance(oauth_id, str) and _ID_RE.match(oauth_id) else [
         f"{where}.id: {entry.get('id')!r} must be lowercase letters, digits and dashes"]
@@ -154,7 +169,7 @@ def _entry_problems(entry: dict, where: str, manifest: Mapping[str, Any]) -> lis
         name = entry.get(field)
         if (required or name) and not (isinstance(name, str) and _ENV_RE.match(name)):
             problems.append(f"{where}.{field}: {name!r} must be an UPPER_SNAKE environment variable name")
-        elif name and _hermes_owned_env(name, manifest):
+        elif name and _hermes_owned_env(name, manifest, installed):
             problems.append(f"{where}.{field}: {name} is a variable Hermes uses itself; declare the plugin's own")
     hosts = entry.get("hosts")
     if not (isinstance(hosts, list) and hosts and all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
@@ -182,9 +197,10 @@ def parse_oauth_clients(manifest: Mapping[str, Any]) -> tuple[list[OAuthClient],
         return [], ["oauth: must be a list of client entries"]
     clients: list[OAuthClient] = []
     problems: list[str] = []
+    installed = functools.cache(_installed_platform_manifests)  # read at most once, and only if a name needs it
     for index, entry in enumerate(raw):
         where = f"oauth[{index}]"
-        entry_problems = (_entry_problems(entry, where, manifest) if isinstance(entry, dict)
+        entry_problems = (_entry_problems(entry, where, manifest, installed) if isinstance(entry, dict)
                           else [f"{where}: must be a mapping"])
         if not entry_problems and any(c.id == entry["id"] for c in clients):
             entry_problems = [f"{where}.id: {entry['id']!r} is declared twice"]

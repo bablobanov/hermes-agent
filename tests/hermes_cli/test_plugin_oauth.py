@@ -664,15 +664,63 @@ def test_a_nameless_platform_plugin_and_a_second_copy_keep_their_own_client_vari
     assert [c.id for c in plugin_oauth._declared_clients(copy)] == ["google"]
 
 
+def test_another_plugins_client_secret_stays_refused_as_a_client_id_on_the_same_endpoints(idp, monkeypatch):
+    """The owner sends VICTIM_SECRET only to the token URL as client_secret; as a client id it would also go into
+    the authorize URL, which the browser shows: same URLs, another channel."""
+    _write_manifest("chat", name="chat", kind="platform",
+                    requires_env=[{"name": "VOICE_CLIENT_ID"}, {"name": "VICTIM_SECRET"}],
+                    oauth=[_entry(idp, client_secret_env="VICTIM_SECRET")])
+    claimant = _write_manifest("claimant", name="claimant", kind="platform",
+                               requires_env=[{"name": "VICTIM_SECRET"}, {"name": "VOICE_CLIENT_SECRET"}],
+                               oauth=[_entry(idp, client_id_env="VICTIM_SECRET")])
+    _registered_like_a_fresh_process(monkeypatch)
+
+    with pytest.raises(ValueError, match="VICTIM_SECRET is a variable Hermes uses itself"):
+        plugin_oauth._declared_clients(claimant)
+
+
+def test_an_owner_that_disappears_while_the_plugins_are_read_leaves_the_name_refused(idp, monkeypatch):
+    """The stamp taken before the read still lists the owner; the read no longer sees it. That snapshot is not
+    complete, now or if the same stamp comes back."""
+    from hermes_cli import config
+
+    victim = _write_manifest("chat", name="chat", kind="platform", requires_env=[{"name": "VICTIM_SECRET"}])
+    claimant = _write_manifest("claimant", **_claim(idp, "claimant"))
+    _registered_like_a_fresh_process(monkeypatch)
+    before = config.platform_manifest_stamp()
+    scan = config._platform_plugin_manifests
+
+    def owner_removed_mid_read(*args, **kwargs):
+        if kwargs.get("source") == "user" and (victim / "plugin.yaml").exists():
+            (victim / "plugin.yaml").unlink()
+        return scan(*args, **kwargs)
+
+    monkeypatch.setattr(config, "_platform_plugin_manifests", owner_removed_mid_read)
+    plugin_oauth._user_platform_manifests.cache_clear()
+    with pytest.raises(ValueError, match="VICTIM_SECRET is a variable Hermes uses itself"):
+        plugin_oauth._declared_clients(claimant)
+    monkeypatch.undo()  # the real stamp again: the owner is gone, which shows
+    assert plugin_oauth._user_platform_manifests(before)[1] is False
+
+
 def test_ownership_reads_the_user_plugins_once_until_a_manifest_changes(idp, monkeypatch):
     from hermes_cli import config
 
     _plugin(oauth=[_entry(idp)], kind="platform")
     _registered_like_a_fresh_process(monkeypatch)
-    reads = []
-    scan = config._platform_plugin_manifests
-    monkeypatch.setattr(config, "_platform_plugin_manifests",
-                        lambda *args, **kwargs: reads.append(kwargs.get("source")) or scan(*args, **kwargs))
-    for _ in range(3):
-        assert [c.id for c in plugin_oauth._declared_clients(_home() / "plugins" / "voice")] == ["google"]
-    assert reads.count("user") <= 1
+    plugin_oauth._user_platform_manifests.cache_clear()
+    stamps, reads = [], []
+    stamp, scan = config.platform_manifest_stamp, config._platform_plugin_manifests
+    monkeypatch.setattr(config, "platform_manifest_stamp", lambda *args, **kwargs: stamps.append(1) or stamp(*args, **kwargs))
+    monkeypatch.setattr(config, "_platform_plugin_manifests", lambda *args, **kwargs: (
+        reads.append(1) if kwargs.get("source") == "user" else None) or scan(*args, **kwargs))
+    plugin_dir = _home() / "plugins" / "voice"
+
+    for _ in range(3):  # both client variables each time
+        assert [c.id for c in plugin_oauth._declared_clients(plugin_dir)] == ["google"]
+    assert (len(reads), len(stamps)) == (1, 3 + 1)  # a stamp per parse, plus one check after the only read
+    manifest = plugin_dir / "plugin.yaml"
+    manifest.write_text(manifest.read_text(encoding="utf-8").replace("test plugin", "test plugin, edited"),
+                        encoding="utf-8")
+    assert [c.id for c in plugin_oauth._declared_clients(plugin_dir)] == ["google"]
+    assert (len(reads), len(stamps)) == (2, 4 + 2)
