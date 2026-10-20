@@ -1,0 +1,50 @@
+# Fork-only (bablobanov/hermes-agent), never part of an upstream PR: the upstream CI runs on
+# Blacksmith runners this fork does not have, so its jobs stay queued here. This runs the same
+# Python suite (scripts/run_tests.sh, locked toolchain from setup-pm) on GitHub-hosted Linux,
+# split into slices the way tests.yml splits it.
+name: Fork Linux tests
+
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Run tests (${{ matrix.slice }}/8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install ripgrep
+        run: sudo apt-get update -q && sudo apt-get install -y -q ripgrep
+
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+          prune-python-cache: true
+
+      - name: Run tests
+        run: scripts/run_tests.sh
+        env:
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/8
+          HERMES_TEST_WORKERS: 4
+          HERMES_TEST_FILE_TIMEOUT: 600
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
