@@ -81,21 +81,44 @@ def _url_problems(where: str, url: Any) -> list[str]:
 
 @functools.cache
 def _bundled_platform_env_names() -> frozenset[str]:
-    """Every name a bundled platform manifest declares; they ship with Hermes, so one read per process."""
+    """Every name a bundled platform manifest declares. They ship with Hermes, so one complete read per process;
+    an unreadable one raises instead, and the next call reads again."""
     from hermes_cli.config import _platform_manifest_env_entries, _platform_plugin_manifests
 
-    return frozenset(name for _dir, manifest in _platform_plugin_manifests(source="bundled")
-                     for name, _secret, _meta in _platform_manifest_env_entries(manifest))
+    skipped: list = []
+    names = frozenset(name for _dir, manifest in _platform_plugin_manifests(source="bundled", skipped=skipped)
+                      for name, _secret, _meta in _platform_manifest_env_entries(manifest))
+    if skipped:
+        raise OSError(f"unreadable bundled platform manifests: {', '.join(map(str, skipped))}")
+    return names
+
+
+@functools.lru_cache(maxsize=8)
+def _user_platform_manifests(stamp: tuple) -> tuple[tuple[dict, ...], bool]:
+    """The installed user platform manifests, and whether every one could be read. *stamp*
+    (``platform_manifest_stamp()``) keys the cache: an added, removed or edited manifest is read again."""
+    from hermes_cli.config import _platform_plugin_manifests
+
+    skipped: list = []
+    manifests = tuple(manifest for _dir, manifest in _platform_plugin_manifests(source="user", skipped=skipped))
+    return manifests, not skipped
+
+
+def _endpoints(manifest: Mapping[str, Any], name: str) -> set[tuple[str, str]]:
+    """``(authorize_url, token_url)`` of each ``oauth:`` entry in *manifest* that sends variable *name*."""
+    return {(str(e.get("authorize_url")), str(e.get("token_url"))) for e in manifest.get("oauth") or []
+            if isinstance(e, dict) and name in (e.get("client_id_env"), e.get("client_secret_env"))}
 
 
 def _hermes_owned_env(name: str, manifest: Mapping[str, Any]) -> bool:
     """A variable Hermes itself reads (a provider key, a platform secret): never a plugin's client variable,
     or a manifest could have Hermes POST that secret to the token URL it names. Platform manifests register
-    their requires_env/optional_env too, for the config form: such a name stays the plugin's own unless core,
-    a bundled platform or another installed plugin declares it."""
+    their requires_env/optional_env too, for the config form. Such a name stays the plugin's own when its
+    manifest declares it and every installed platform manifest that declares it sends it to the same
+    endpoints (a second copy, the next version); a manifest that cannot be read counts as another owner."""
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.config import (
-        _EXTRA_ENV_KEYS, CORE_DECLARED_ENV_NAMES, _platform_manifest_env_entries, _platform_plugin_manifests)
+        _EXTRA_ENV_KEYS, CORE_DECLARED_ENV_NAMES, _platform_manifest_env_entries, platform_manifest_stamp)
     from hermes_cli.config_env_routing import is_registered_env_name
     from hermes_cli.setup_hidden_env import is_setup_hidden_env
 
@@ -104,12 +127,18 @@ def _hermes_owned_env(name: str, manifest: Mapping[str, Any]) -> bool:
     if not is_registered_env_name(name):
         return False
     if (name in CORE_DECLARED_ENV_NAMES or name in _EXTRA_ENV_KEYS or is_setup_hidden_env(name)
-            or name in _bundled_platform_env_names() or name not in _declared_env_names(manifest)):
+            or name not in _declared_env_names(manifest)):
         return True
-    plugin = str(manifest.get("name") or "")
-    return any(str(other.get("name") or dir_name) != plugin
-               and any(declared == name for declared, _secret, _meta in _platform_manifest_env_entries(other))
-               for dir_name, other in _platform_plugin_manifests(source="user"))
+    try:
+        if name in _bundled_platform_env_names():
+            return True
+    except OSError:
+        return True
+    installed, complete = _user_platform_manifests(platform_manifest_stamp())
+    ours = _endpoints(manifest, name)
+    return not complete or any(
+        not ours <= _endpoints(other, name) for other in installed
+        if any(declared == name for declared, _secret, _meta in _platform_manifest_env_entries(other)))
 
 
 def _entry_problems(entry: dict, where: str, manifest: Mapping[str, Any]) -> list[str]:

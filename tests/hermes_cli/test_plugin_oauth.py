@@ -610,3 +610,69 @@ def test_a_platform_plugin_cannot_claim_a_variable_that_is_not_only_its_own(idp,
     with pytest.raises(ValueError, match=f"{name} is a variable Hermes uses itself"):
         plugin_oauth._declared_clients(_home() / "plugins" / "voice")
     assert idp.token_requests == []
+
+
+def _write_manifest(directory: str, **manifest) -> Path:
+    root = _home() / "plugins" / directory
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "plugin.yaml").write_text(json.dumps(manifest), encoding="utf-8")
+    return root
+
+
+def _claim(idp: FakeIdP, name: str) -> dict:
+    """A platform manifest that lists another plugin's VICTIM_SECRET as its own client secret."""
+    return dict(name=name, kind="platform", requires_env=[{"name": "VOICE_CLIENT_ID"}, {"name": "VICTIM_SECRET"}],
+                oauth=[_entry(idp, client_secret_env="VICTIM_SECRET")])
+
+
+def test_another_plugins_secret_stays_refused_to_a_plugin_that_repeats_its_name(idp, monkeypatch):
+    """The owner is told apart by where a variable goes, not by a manifest name a second directory can repeat."""
+    _write_manifest("chat", name="chat", kind="platform", requires_env=[{"name": "VICTIM_SECRET"}])
+    claimant = _write_manifest("chat-copy", **_claim(idp, "chat"))
+    _registered_like_a_fresh_process(monkeypatch)
+
+    with pytest.raises(ValueError, match="VICTIM_SECRET is a variable Hermes uses itself"):
+        plugin_oauth._declared_clients(claimant)
+    assert idp.token_requests == []
+
+
+def test_another_plugins_secret_stays_refused_when_its_manifest_turns_unreadable(idp, monkeypatch):
+    """Registered while the owner's manifest was readable; once it no longer parses, the owner cannot be seen, so
+    the name stays refused rather than looking unowned."""
+    victim = _write_manifest("chat", name="chat", kind="platform", requires_env=[{"name": "VICTIM_SECRET"}])
+    claimant = _write_manifest("claimant", **_claim(idp, "claimant"))
+    _registered_like_a_fresh_process(monkeypatch)
+    with pytest.raises(ValueError, match="VICTIM_SECRET is a variable Hermes uses itself"):
+        plugin_oauth._declared_clients(claimant)
+
+    (victim / "plugin.yaml").write_text("name: [chat", encoding="utf-8")
+    with pytest.raises(ValueError, match="VICTIM_SECRET is a variable Hermes uses itself"):
+        plugin_oauth._declared_clients(claimant)
+    assert idp.token_requests == []
+
+
+def test_a_nameless_platform_plugin_and_a_second_copy_keep_their_own_client_variables(idp, monkeypatch):
+    """A manifest without ``name`` (installed under its repository's name) and a second copy of the same plugin in
+    another directory send the variables to the same endpoints: both stay the plugin's own."""
+    manifest = dict(kind="platform", requires_env=[{"name": "VOICE_CLIENT_ID"}, {"name": "VOICE_CLIENT_SECRET"}],
+                    oauth=[_entry(idp)])
+    nameless = _write_manifest("voice", **manifest)
+    copy = _write_manifest("voice-link", name="voice", **manifest)
+    _registered_like_a_fresh_process(monkeypatch)
+
+    assert [c.id for c in plugin_oauth._declared_clients(nameless)] == ["google"]
+    assert [c.id for c in plugin_oauth._declared_clients(copy)] == ["google"]
+
+
+def test_ownership_reads_the_user_plugins_once_until_a_manifest_changes(idp, monkeypatch):
+    from hermes_cli import config
+
+    _plugin(oauth=[_entry(idp)], kind="platform")
+    _registered_like_a_fresh_process(monkeypatch)
+    reads = []
+    scan = config._platform_plugin_manifests
+    monkeypatch.setattr(config, "_platform_plugin_manifests",
+                        lambda *args, **kwargs: reads.append(kwargs.get("source")) or scan(*args, **kwargs))
+    for _ in range(3):
+        assert [c.id for c in plugin_oauth._declared_clients(_home() / "plugins" / "voice")] == ["google"]
+    assert reads.count("user") <= 1
