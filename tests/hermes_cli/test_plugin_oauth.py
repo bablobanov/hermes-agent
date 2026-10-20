@@ -76,13 +76,13 @@ def _entry(idp: FakeIdP, **overrides) -> dict:
     return {**entry, **overrides}
 
 
-def _plugin(name: str = "voice", oauth: list | None = None, display: str | None = None):
+def _plugin(name: str = "voice", oauth: list | None = None, display: str | None = None, **fields):
     """Write ``plugins/<name>`` (manifest plus a module that calls the helper) and import it like a plugin.
-    *display* is a manifest ``name`` other than the directory."""
+    *display* is a manifest ``name`` other than the directory; *fields* are further manifest keys."""
     root = _home() / "plugins" / name
     root.mkdir(parents=True, exist_ok=True)
     manifest = {"name": display or name, "version": "1.0.0", "description": "test plugin",
-                "requires_env": [{"name": "VOICE_CLIENT_ID"}, {"name": "VOICE_CLIENT_SECRET"}]}
+                "requires_env": [{"name": "VOICE_CLIENT_ID"}, {"name": "VOICE_CLIENT_SECRET"}], **fields}
     if oauth is not None:
         manifest["oauth"] = oauth
     (root / "plugin.yaml").write_text(json.dumps(manifest), encoding="utf-8")  # JSON is valid YAML
@@ -569,3 +569,44 @@ def test_sign_in_is_refused_where_nobody_can_answer_the_browser(idp, monkeypatch
     with pytest.raises(SystemExit, match="your own terminal"):
         _auth("add")
     assert idp.token_requests == [] and idp.opened == []
+
+
+def _registered_like_a_fresh_process(monkeypatch) -> None:
+    """``hermes_cli.config`` feeds every platform manifest's requires_env/optional_env into OPTIONAL_ENV_VARS at
+    import; this process imported it before the test wrote its plugins, so run that pass again."""
+    from hermes_cli import config
+
+    monkeypatch.setattr(config, "OPTIONAL_ENV_VARS", dict(config.OPTIONAL_ENV_VARS))
+    config._inject_platform_plugin_env_vars()
+
+
+def test_a_platform_plugin_signs_in_with_the_client_variables_it_declares(idp, monkeypatch):
+    """A ``kind: platform`` plugin lists its client variables in requires_env, as catalog admission demands, and
+    that list also feeds the config form: they stay its own, not variables Hermes uses itself."""
+    from hermes_cli.config_env_routing import is_registered_env_name
+
+    _plugin(oauth=[_entry(idp)], kind="platform")
+    _registered_like_a_fresh_process(monkeypatch)
+    assert is_registered_env_name("VOICE_CLIENT_ID") and is_registered_env_name("VOICE_CLIENT_SECRET")
+
+    assert _auth("add") is True and _grant()["refresh_token"] in idp.refresh_tokens
+    installed = json.loads((_home() / "plugins" / "voice" / "plugin.yaml").read_text(encoding="utf-8"))
+    # The re-pin consent surface lists the client for the installed manifest and for its next version alike.
+    assert plugin_oauth.oauth_surface(installed) == plugin_oauth.oauth_surface({**installed, "version": "1.1.0"}) != set()
+
+
+@pytest.mark.parametrize(("plugin_name", "name"), [
+    ("voice", "CHAT_BOT_TOKEN"), ("voice", "TELEGRAM_BOT_TOKEN"), ("voice", "OPENROUTER_API_KEY"),
+    ("ntfy-platform", "NTFY_TOKEN"),  # a bundled platform's variable, under that platform's own name
+], ids=["another-platform-plugin", "core", "provider-key", "bundled-platform"])
+def test_a_platform_plugin_cannot_claim_a_variable_that_is_not_only_its_own(idp, monkeypatch, plugin_name, name):
+    """Listing another plugin's, a core, a provider or a bundled platform's variable in its own requires_env
+    does not make it the plugin's: Hermes would POST that secret to the token URL the plugin names."""
+    _plugin("chat", requires_env=[{"name": "CHAT_BOT_TOKEN"}], kind="platform")
+    _plugin(oauth=[_entry(idp, client_secret_env=name)], display=plugin_name, kind="platform",
+            requires_env=[{"name": "VOICE_CLIENT_ID"}, {"name": name}])
+    _registered_like_a_fresh_process(monkeypatch)
+
+    with pytest.raises(ValueError, match=f"{name} is a variable Hermes uses itself"):
+        plugin_oauth._declared_clients(_home() / "plugins" / "voice")
+    assert idp.token_requests == []
